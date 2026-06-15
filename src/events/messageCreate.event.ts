@@ -77,9 +77,12 @@ async function checkAttachmentSpam(client: BotClient, message: Message): Promise
     const attachmentHashes = await Promise.all(
         [...message.attachments.values()].map(attachment => getAttachmentHash(attachment.url))
     )
-    if (attachmentHashes.some(hash => !hash)) return false
+    const validAttachmentHashes = attachmentHashes.filter(
+        (hash): hash is string => hash !== null
+    )
+    if (validAttachmentHashes.length !== attachmentHashes.length) return false
 
-    const normalizedHashes = (attachmentHashes as string[]).sort().join(".")
+    const normalizedHashes = validAttachmentHashes.sort().join(".")
     const now = Date.now()
     clearOldAttachmentHashes(now)
 
