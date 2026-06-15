@@ -3,6 +3,7 @@ import BotGuildMember from "../struct/discord/BotGuildMember.js"
 import BotGuild from "../struct/discord/BotGuild.js"
 import Snippet from "../entities/Snippet.entity.js"
 import languages from "../struct/client/iso6391.js"
+import crypto from "crypto"
 
 import chalk = require("chalk")
 import { noop } from "@buildtheearth/bot-utils"
@@ -10,6 +11,9 @@ import { Message, MessageType } from "discord.js"
 import typeorm from "typeorm"
 import ModerationMenu from "../entities/ModerationMenu.entity.js"
 import { runBtCommand } from "../commands/team.command.js"
+
+const ATTACHMENT_DUPLICATE_WINDOW = 30_000
+const recentAttachmentHashes: Map<string, number> = new Map()
 
 function consumeCommand(client: BotClient, message: Message): string {
     const content = message.content
@@ -50,9 +54,55 @@ function consumeTeam(client: BotClient, message: Message): string {
     return commandSplit.join(" ").trim() || ""
 }
 
+function clearOldAttachmentHashes(now: number): void {
+    for (const [hash, timestamp] of recentAttachmentHashes) {
+        if (now - timestamp > ATTACHMENT_DUPLICATE_WINDOW) {
+            recentAttachmentHashes.delete(hash)
+        }
+    }
+}
+
+async function getAttachmentHash(url: string): Promise<string | null> {
+    const attachmentFetch = await fetch(url).catch(noop)
+    if (!attachmentFetch?.ok) return null
+    const arrayBuffer = await attachmentFetch.arrayBuffer().catch(() => null)
+    if (!arrayBuffer) return null
+    return crypto.createHash("sha256").update(Buffer.from(arrayBuffer)).digest("hex")
+}
+
+async function checkAttachmentSpam(client: BotClient, message: Message): Promise<boolean> {
+    if (message.guild?.id !== client.config.guilds.main) return false
+    if (message.attachments.size < 1) return false
+
+    const attachmentHashes = await Promise.all(
+        [...message.attachments.values()].map(attachment => getAttachmentHash(attachment.url))
+    )
+    if (attachmentHashes.some(hash => !hash)) return false
+
+    const normalizedHashes = (attachmentHashes as string[]).sort().join(".")
+    const now = Date.now()
+    clearOldAttachmentHashes(now)
+
+    const previous = recentAttachmentHashes.get(normalizedHashes)
+    recentAttachmentHashes.set(normalizedHashes, now)
+    if (!previous || now - previous > ATTACHMENT_DUPLICATE_WINDOW) return false
+
+    await message.delete().catch(noop)
+    const logChannel = await client.channels.fetch(client.config.logging.modLogs).catch(() => null)
+    if (logChannel?.isSendable())
+        await client.response.sendError(
+            logChannel,
+            `Deleted duplicate attachment spam from <@${message.author.id}> in <#${message.channel.id}> ([Jump to message](https://discord.com/channels/${message.guild.id}/${message.channel.id}/${message.id})).`
+        )
+    return true
+}
+
 export default async function (this: BotClient, message: Message): Promise<unknown> {
     if (message.partial) await message.fetch().catch(noop)
     if (message.author.bot) return
+
+    if (await checkAttachmentSpam(this, message)) return
+
     const Snippets = Snippet.getRepository()
 
     const mainGuild = await this.customGuilds.main()
